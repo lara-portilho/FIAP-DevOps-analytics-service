@@ -3,3 +3,8 @@ Werkzeug<3
 gunicorn==20.1.0
 python-dotenv==0.21.0
 boto3==1.26.50
+opentelemetry-distro==0.66b1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-instrumentation-flask==0.66b1
+opentelemetry-instrumentation-logging==0.66b1
+opentelemetry-instrumentation-botocore==0.66b1
