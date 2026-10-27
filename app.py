@@ -9,10 +9,40 @@ import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
 from flask import Flask, jsonify
 from dotenv import load_dotenv
+from opentelemetry import propagate, trace
+from opentelemetry.instrumentation.utils import suppress_instrumentation
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
-# Configura o logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class JsonFormatter(logging.Formatter):
+    """ Log em JSON (uma linha por evento) para o Alloy/Loki. Os campos otelTraceID e
+    otelSpanID são injetados pela instrumentação de logging do OpenTelemetry
+    (OTEL_PYTHON_LOG_CORRELATION=true) e permitem pular do log para o trace. """
+
+    def format(self, record):
+        entry = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        trace_id = getattr(record, "otelTraceID", "0")
+        if trace_id and trace_id != "0":
+            entry["trace_id"] = trace_id
+            entry["span_id"] = getattr(record, "otelSpanID", "")
+        if record.exc_info:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry, ensure_ascii=False)
+
+
+# Configura o logging (force=True substitui o handler que o opentelemetry-instrument
+# já tenha criado, mantendo a injeção de trace_id/span_id nos registros)
+_handler = logging.StreamHandler()
+_handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 log = logging.getLogger(__name__)
+
+tracer = trace.get_tracer("analytics-service")
 
 # Carrega .env para desenvolvimento local
 load_dotenv()
@@ -45,7 +75,36 @@ except Exception as e:
 # --- SQS Worker ---
 
 def process_message(message):
-    """ Processa uma única mensagem SQS e a insere no DynamoDB """
+    """ Processa uma única mensagem SQS e a insere no DynamoDB.
+
+    O evaluation-service envia o contexto do trace (traceparent) nos
+    MessageAttributes; o span CONSUMER criado aqui continua esse trace, então o
+    APM mostra evaluation -> analytics no mesmo trace/Service Map. As chamadas
+    ao DynamoDB e ao SQS (botocore instrumentado) ficam como filhas dele.
+    """
+    carrier = {
+        key: attr["StringValue"]
+        for key, attr in message.get("MessageAttributes", {}).items()
+        if attr.get("DataType") == "String"
+    }
+    parent_ctx = propagate.extract(carrier)
+    queue_name = SQS_QUEUE_URL.rstrip("/").split("/")[-1]
+
+    with tracer.start_as_current_span(
+        f"process {queue_name}",
+        context=parent_ctx,
+        kind=SpanKind.CONSUMER,
+        attributes={
+            "messaging.system": "aws_sqs",
+            "messaging.operation.type": "process",
+            "messaging.destination.name": queue_name,
+            "messaging.message.id": message["MessageId"],
+        },
+    ) as span:
+        _process_message(message, span)
+
+
+def _process_message(message, span):
     try:
         log.info(f"Processando mensagem ID: {message['MessageId']}")
         body = json.loads(message['Body'])
@@ -68,6 +127,7 @@ def process_message(message):
             Item=item
         )
 
+        span.set_attribute("flag.name", body['flag_name'])
         log.info(f"Evento {event_id} (Flag: {body['flag_name']}) salvo no DynamoDB.")
 
         # Se tudo deu certo, deleta a mensagem da fila
@@ -76,13 +136,19 @@ def process_message(message):
             ReceiptHandle=message['ReceiptHandle']
         )
 
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        span.record_exception(e)
+        span.set_status(Status(StatusCode.ERROR, "JSON inválido"))
         log.error(f"Erro ao decodificar JSON da mensagem ID: {message['MessageId']}")
         # Não deleta a mensagem, pode ser uma "poison pill"
     except ClientError as e:
+        span.record_exception(e)
+        span.set_status(Status(StatusCode.ERROR, "erro do Boto3"))
         log.error(f"Erro do Boto3 (DynamoDB ou SQS) ao processar {message['MessageId']}: {e}")
         # Não deleta a mensagem, tenta novamente
     except Exception as e:
+        span.record_exception(e)
+        span.set_status(Status(StatusCode.ERROR, "erro inesperado"))
         log.error(f"Erro inesperado ao processar {message['MessageId']}: {e}")
         # Não deleta a mensagem, tenta novamente
 
@@ -92,12 +158,15 @@ def sqs_worker_loop():
     log.info("Iniciando o worker SQS...")
     while True:
         try:
-            # Long-polling: espera até 20s por mensagens
-            response = sqs_client.receive_message(
-                QueueUrl=SQS_QUEUE_URL,
-                MaxNumberOfMessages=10,  # Processa em lotes de até 10
-                WaitTimeSeconds=20
-            )
+            # Long-polling: espera até 20s por mensagens. O span do ReceiveMessage é
+            # suprimido para não gerar um trace vazio a cada 20s no APM.
+            with suppress_instrumentation():
+                response = sqs_client.receive_message(
+                    QueueUrl=SQS_QUEUE_URL,
+                    MaxNumberOfMessages=10,  # Processa em lotes de até 10
+                    WaitTimeSeconds=20,
+                    MessageAttributeNames=["All"]  # traz o traceparent enviado pelo evaluation-service
+                )
 
             messages = response.get('Messages', [])
             if not messages:
